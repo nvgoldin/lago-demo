@@ -1,8 +1,37 @@
 #!/bin/bash -e
 
-REPONAME="ovirt-system-tests"
-REPOURL="https://gerrit.ovirt.org"
+readonly REPONAME="ovirt-system-tests"
+readonly REPOURL="https://gerrit.ovirt.org"
 
+readonly RHEL_CHANNELS=(
+'rhel-7-server-rpms'
+'rhel-7-server-optional-rpms'
+'rhel-7-server-extras-rpms'
+'rhel-7-server-rhv-4-mgmt-agent-rpms'
+)
+
+join_array() {
+    local sep arr
+    sep=','
+    arr=("$@")
+    res=$(IFS="$sep" ; echo "${arr[*]}")
+    echo -E "$res"
+}
+
+
+print_rhel_notes() {
+    echo "
+Except the Lago repository, no repositories will be configured. Before running
+the script, please ensure you have the below channels enabled:
+
+$(join_array "${RHEL_CHANNELS[@]}")
+
+After enabling the those repositories, ensure also EPEL is enabled. If you want
+to use the upstream repository, run:
+
+  yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+  "
+}
 
 exit_error() {
     ! [[ -z "$1" ]] && echo "ERROR: $1"
@@ -19,25 +48,43 @@ check_virtualization() {
   fi
 }
 
-check_cpu_man() {
-  if lscpu | grep -q 'Model name:\s*Intel'; then
-    echo intel
+get_cpu_vendor() {
+  local vendor
+  vendor=$(lscpu | awk '/Vendor ID/{print $3}')
+  if [[ "$vendor" == 'GenuineIntel' ]]; then
+      echo "intel"
+  elif [[ "$vendor" == 'AuthenticAMD' ]]; then
+      echo "amd"
   else
-    echo amd
+      exit_error "unrecognized CPU vendor: $vendor, only Intel/AMD are \
+       supported"
   fi
 }
 
+check_nested() {
+    local mod
+    mod="kvm_$1"
+    is_enabled=$(cat "/sys/module/$mod/parameters/nested")
+    [[ "$is_enabled" == 'Y' ]] && return 0 || return 1
+}
+
+reload_kvm() {
+    local mod
+    mod="kvm-$1"
+    (modprobe -R "$mod" && modprobe "$mod") && return 0 || return 1
+}
+
 enable_nested() {
-  local cpu_man=$(check_cpu_man)
-  local is_enabled=$(cat /sys/module/kvm_"$cpu_man"/parameters/nested)
-  if [[ "$is_enabled" == 'N' ]]; then
-      echo "Enabling nested virtualization..."
-      echo "options kvm-$cpu_man nested=y" >> /etc/modprobe.d/kvm-"$cpu_man".conf
-      echo "Please restart and rerun installation"
-      exit 1
-  else
-      echo "Nested virtualization is enabled"
-  fi
+    local vendor
+    vendor=$(get_cpu_vendor)
+    if ! check_nested "$vendor"; then
+        echo "Enabling nested virtualization..."
+        echo "options kvm-$vendor nested=y" >> "/etc/modprobe.d/kvm-$vendor.conf"
+        (reload_kvm "$vendor" && check_nested "$vendor") || \
+            exit_error "Nested virtualization is not enabled, please reboot \
+        and re-run."
+    fi
+    echo "Nested virtualization is enabled"
 }
 
 install_lago() {
@@ -58,25 +105,8 @@ add_lago_repo() {
             echo "Adding EPEL repository"
             yum -y install epel-release
         else
-            echo "
-            Detected distro is RHEL 7, please ensure you have the following
-            repositories enabled:
-
-            rhel-7-server-rpms
-            rhel-7-server-optional-rpms
-            rhel-7-server-extras-rpms
-            rhel-7-server-rhv-4-mgmt-agent-rpms
-
-            And EPEL, which can be installed(after enabling the above
-            repositories), by running:
-
-              yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
-
-            Continuing installation, if it fails on missing packages,
-            try configuring the repositories and re-try.
-
-            If you need any help, feel free to email: infra@ovirt.org
-            "
+            echo "Detected distro is RHEL 7"
+            print_rhel_notes
         fi
     elif [[ $distro_str =~ ^.fc2[45]$ ]]; then
         echo "Detected distro is Fedora"
@@ -104,27 +134,21 @@ EOF
 post_install_conf_for_lago() {
     echo "Configuring permissions"
     local user_home
-    if [[ "$user" != "root" ]]; then
-        user_home=$(eval echo "~$user")
-        usermod -a -G lago "$user"
-        usermod -a -G qemu "$user"
-        chmod g+x "$user_home"
-    else
-        chmod g+x "/root"
-    fi
-
-    usermod -a -G "$user" qemu
+    user_home=$(eval echo "~$INSTALL_USER")
+    usermod -a -G lago,qemu "$INSTALL_USER"
+    usermod -a -G "$INSTALL_USER" qemu
+    chmod g+x "$user_home"
 }
 
 enable_libvirt() {
     echo "Starting libvirt"
-    systemctl restart libvirtd
     systemctl enable libvirtd
+    systemctl restart libvirtd
 }
 
 run_suite() {
-    sudo -u "$user" bash <<EOF
-if [[ ! "$suite" ]]; then
+    sudo -u "$INSTALL_USER" bash <<EOF
+if [[ ! "$SUITE" ]]; then
     exit 0
 fi
 
@@ -138,48 +162,105 @@ else
     cd "$REPONAME"
 fi
 # check if the suite exists
-if [[ "$?" == "0" ]] && [[ -d "$suite" ]]; then
-    ./run_suite.sh "$suite"
+if [[ "$?" == "0" ]] && [[ -d "$SUITE" ]]; then
+    ./run_suite.sh "$SUITE"
 else
-    echo "Suite $suite wasn't found"
+    echo "Suite $SUITE wasn't found"
     exit 1
 fi
 EOF
 }
 
 print_help() {
-  cat<<EOH
-Usage: $0 user_name [suite_to_run]
+  echo "
+Usage: $0
+$0 [options]
 
-Will install Lago and then clone oVirt system tests to the
-current directory and run suite_to_run
+Lago installation script, supported distros: el7/fc24/fc25
 
-The required permissions to run lago will be given to user_name.
+Optionally, you can pass a '--suite' parameter, and it will also download and
+execute one of the available oVirt system tests suites.
 
-If suite_to_run isn't specified Lago will be installed and no
-suite will be run.
-EOH
+This script must be ran as root, but Lago should not be ran as root. The script
+will attempt to detect the user that triggered the command. If you wish to
+configure a different user, use '--user'.
+
+CentOS notes
+------------
+Except the Lago repository, it will also install epel-release, which will
+enable EPEL.
+
+RHEL notes
+----------$(print_rhel_notes)
+
+
+Optional arguments:
+    -u,--user USERNAME
+        Setup the necessary permissions for the specified user in order to run
+        Lago. By default, it will use the output of 'logname'.
+
+    -s,--suite SUITENAME
+        Name of oVirt system tests suite to clone and execute, for available
+        lists of suites, see:
+            https://github.com/ovirt/ovirt-system-tests
+
+    -h,--help
+        Print this message.
+"
 }
 
-check_input() {
-    id -u "$1" > /dev/null ||
-    {
-        echo "User $1 doesn't exist"
-        print_help
-        exit 1
-    }
+parse_args() {
+    local options
+    options=$( \
+        getopt \
+            -o hu:s: \
+            --long help,user:,suite: \
+            -n 'install_lago.sh' \
+            -- "$@" \
+    )
+    eval set -- "$options"
+    while true; do
+        case $1 in
+            -u|--user)
+                INSTALL_USER="$2"
+                shift 2
+                ;;
+            -s|--suite)
+                SUITE="$2"
+                shift 2
+                ;;
+            -h|--help)
+                print_help && exit 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+        esac
+    done
+    if [[ -z "$INSTALL_USER" ]]; then
+        INSTALL_USER=$(logname) || exit_error "failed running 'logname' to \
+            detect the username. Try running with --user USERNAME"
+        echo "detected user: $INSTALL_USER"
+    fi
+    id -u "$INSTALL_USER" > /dev/null || \
+            exit_error "user: $INSTALL_USER does not exist."
+
+    if [[ "$EUID" -ne 0 ]]; then
+        exit_error "must be ran as root, see --help."
+    fi
+
 }
 
 main() {
-    check_input "$1"
-    user="$1"
-    suite="$2"
+    parse_args "$@"
     check_virtualization
     enable_nested
     add_lago_repo
     install_lago
     post_install_conf_for_lago
     enable_libvirt
+    echo "Finished installing and configuring Lago for user $INSTALL_USER."
     run_suite
 }
 
